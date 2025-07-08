@@ -3,6 +3,7 @@ package com.felnanuke.google_cast
 import com.felnanuke.google_cast.extensions.toMap
 import com.google.android.gms.cast.framework.*
 import io.flutter.embedding.engine.plugins.FlutterPlugin
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 
@@ -13,7 +14,7 @@ private const val TAG = "SessionManager"
 
 /**
  * Flutter method channel for Google Cast session management
- * 
+ *
  * This class manages the complete lifecycle of Google Cast sessions, including session
  * creation, connection, monitoring, and termination. It implements the Google Cast
  * SessionManagerListener to receive session events and communicates session state
@@ -50,25 +51,38 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
 
     /**
      * Flutter method channel for session management communication
-     * 
+     *
      * Handles method calls related to Cast session operations and sends
      * session state updates to Flutter. Channel name:
      * "com.felnanuke.google_cast.session_manager"
      */
     private lateinit var channel: MethodChannel
-    
+
+    /**
+     * Flutter event channel for received data from custom cast channels
+     *
+     * Sends the received data from Android to Dart. Channel name:
+     * "com.felnanuke.google_cast.custom_channels"
+     */
+    private lateinit var customChannelsEventChannel: EventChannel
+
+    /**
+     * Flutter event sink for customChannelsEventChannel
+     */
+    private var customChannelsEventSink: EventChannel.EventSink? = null
+
     /**
      * Reference to discovery manager for device selection
-     * 
+     *
      * Used during session creation to select and connect to specific Cast
      * devices identified by their device ID. Provides the bridge between
      * device discovery and session establishment.
      */
     private val discoveryManagerMethodChannel: DiscoveryManagerMethodChannel = discoveryManager
-    
+
     /**
      * Remote media client method channel for media operations
-     * 
+     *
      * Handles all media-related operations during active Cast sessions,
      * including media loading, playback control, and media state monitoring.
      * Automatically initialized and managed by the session manager.
@@ -77,10 +91,10 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
 
     /**
      * Google Cast session manager instance
-     * 
+     *
      * Provides access to the current Cast session manager from the Google Cast
      * SDK. Used for all session lifecycle operations and state queries.
-     * 
+     *
      * @return The current session manager instance, or null if Cast context not initialized
      */
     private val sessionManager: SessionManager?
@@ -88,11 +102,18 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
             return CastContext.getSharedInstance()?.sessionManager
         }
 
+    /**
+     * Google Cast custom channels
+     *
+     * The namespaces of the custom channels that the app should listen to
+     */
+    private var customNamespaces: Array<String> = arrayOf()
+
     // MARK: - Flutter Plugin Lifecycle
 
     /**
      * Called when the Flutter plugin is attached to the Flutter engine
-     * 
+     *
      * Initializes the session manager method channel and sets up the remote
      * media client for media operations during Cast sessions.
      *
@@ -107,13 +128,18 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         channel =
             MethodChannel(binding.binaryMessenger, "com.felnanuke.google_cast.session_manager")
+        customChannelsEventChannel =
+            EventChannel(binding.binaryMessenger, "com.felnanuke.google_cast.custom_channels")
+
         channel.setMethodCallHandler(this)
+        customChannelsEventChannel.setStreamHandler(CustomChannelsStreamHandler())
+
         remoteMediaClientMethodChannel.onAttachedToEngine(binding)
     }
 
     /**
      * Called when the Flutter plugin is detached from the Flutter engine
-     * 
+     *
      * Performs cleanup of session manager resources to prevent memory leaks.
      *
      * Cleanup operations:
@@ -129,7 +155,7 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
 
     /**
      * Handles method calls from the Flutter side
-     * 
+     *
      * Processes incoming method calls for Cast session management operations.
      * Manages session lifecycle and device control during active sessions.
      *
@@ -148,12 +174,25 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
             "endSessionAndStopCasting" -> sessionManager?.endCurrentSession(true)
             "endSession" -> sessionManager?.endCurrentSession(false)
             "setStreamVolume" -> sessionManager?.currentCastSession?.volume = call.arguments as Double
+            "sendMessage" -> sendMessage(call, result)
         }
     }
 
     /**
+     * Sets the custom namespaces that should be listened to
+     *
+     * Each of the namespaces in customNamespaces are being listened to when
+     * the session is started or resumed
+     *
+     * @param customNamespaces Array of namespaces
+     */
+    fun setCustomNamespaces(customNamespaces: Array<String>) {
+        this.customNamespaces = customNamespaces
+    }
+
+    /**
      * Initiates a Cast session with the specified device
-     * 
+     *
      * Starts a new Cast session by selecting the target device through the
      * discovery manager and initiating the connection process. The actual
      * session connection status is reported through session manager listener
@@ -168,9 +207,49 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
         result.success(true)
     }
 
+    private fun sendMessage(call: MethodCall, result: MethodChannel.Result) {
+        val namespace = call.argument<String>("namespace");
+        val message = call.argument<String>("message");
+
+        if (namespace != null && message != null) {
+            val session = sessionManager?.currentCastSession
+
+            if (session != null && session.isConnected) {
+                session.sendMessage(namespace, message)
+                result.success(true)
+            } else {
+                result.success(false)
+            }
+        } else {
+            result.error("INVALID_ARGUMENTS", "namespace and message is required", null)
+        }
+    }
+
+    private fun registerCustomNamespaces() {
+        val session = sessionManager?.currentCastSession
+
+        if (session != null && session.isConnected) {
+            customNamespaces.forEach { n ->
+                session.setMessageReceivedCallbacks(n) { _, namespace, message ->
+                    customChannelsEventSink?.success(mapOf("namespace" to namespace, "message" to message))
+                }
+            }
+        }
+    }
+
+    private fun unregisterCustomNamespaces() {
+        val session = sessionManager?.currentCastSession
+
+        if (session != null && session.isConnected) {
+            customNamespaces.forEach { n ->
+                session.removeMessageReceivedCallbacks(n)
+            }
+        }
+    }
 
     //SessionManagerLister
     override fun onSessionEnded(session: Session, p1: Int) {
+        unregisterCustomNamespaces()
         onSessionChanged()
     }
 
@@ -179,12 +258,13 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
     }
 
     override fun onSessionResumeFailed(p0: Session, p1: Int) {
-
+        unregisterCustomNamespaces()
         onSessionChanged()
     }
 
     override fun onSessionResumed(p0: Session, p1: Boolean) {
         remoteMediaClientMethodChannel.startListen()
+        registerCustomNamespaces()
         onSessionChanged()
     }
 
@@ -193,11 +273,13 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
     }
 
     override fun onSessionStartFailed(p0: Session, p1: Int) {
+        unregisterCustomNamespaces()
         onSessionChanged()
     }
 
     override fun onSessionStarted(session: Session, p1: String) {
         remoteMediaClientMethodChannel.startListen()
+        registerCustomNamespaces()
         onSessionChanged()
     }
 
@@ -206,9 +288,9 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
     }
 
     override fun onSessionSuspended(p0: Session, p1: Int) {
+        unregisterCustomNamespaces()
         onSessionChanged()
     }
-
 
     private fun onSessionChanged() {
         val session = sessionManager?.currentCastSession
@@ -216,5 +298,13 @@ class SessionManagerMethodChannel(discoveryManager: DiscoveryManagerMethodChanne
         channel.invokeMethod("onSessionChanged", map)
     }
 
+    private inner class CustomChannelsStreamHandler : EventChannel.StreamHandler {
+        override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+            customChannelsEventSink = events
+        }
 
+        override fun onCancel(arguments: Any?) {
+            customChannelsEventSink = null
+        }
+    }
 }
